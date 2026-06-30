@@ -1,0 +1,31 @@
+# Netlify 배포 설정
+# 정적 사이트 - 빌드 스텝 없음
+
+[build]
+  publish = "."
+
+# 모든 응답에 기본 보안 헤더
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+# index.html은 항상 새 버전
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# config.js도 항상 새 버전 (디렉터리 URL 바뀔 수 있으니까)
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# api.js도 no-cache (코드 업데이트 즉시 반영)
+[[headers]]
+  for = "/api.js"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
