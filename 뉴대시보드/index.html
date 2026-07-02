@@ -5471,8 +5471,8 @@ body.dark .ft-ntest-count { background: rgba(30,64,175,.3); color: #93c5fd; }
 }
 .ft-ntest-btn { width: 100%; padding: 10px; font-size: 13px; font-weight: 600; }
 </style>
-<script src="config.js?v=177"></script>
-<script src="api.js?v=177"></script>
+<script src="config.js?v=181"></script>
+<script src="api.js?v=181"></script>
 <!-- ⭐ 마크다운 렌더링 (학습 자료용) -->
 <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -7138,6 +7138,9 @@ function syncWeeklyHolidaysBackground_(opts) {
 }
 
 function sv(view) {
+  // ⭐ 현재 활성 뷰 추적 — renderAll이 bg refresh / optimistic UI 후 호출될 때
+  //    사용자가 보고 있는 페이지를 우선 렌더하기 위함
+  window.__currentView = view;
   ['main','goals','weakness','mock','schedule','study-method','frequent-test','condition','exam-record','challenge'].forEach(function(v) {
     var el = $('v-' + v);
     if (el) el.style.display = (v === view) ? '' : 'none';
@@ -7441,25 +7444,68 @@ function reload() {
 /* ───────────────────────────── 렌더 ───────────────────────────── */
 function renderAll() {
   if (!DATA) return;
+
+  // ⭐ 진입 페이지 결정 — 첫 호출 시는 URL ?page= 파라미터, 이후엔 사용자가 활성화한 뷰
+  var visiblePage;
+  if (!window.__initialPageApplied) {
+    try {
+      var params = new URLSearchParams(window.location.search);
+      var p = String(params.get('page') || '').trim().toLowerCase();
+      var valid = { 'main':1, 'goals':1, 'weakness':1, 'mock':1, 'schedule':1,
+                    'study-method':1, 'frequent-test':1, 'condition':1, 'exam-record':1, 'challenge':1 };
+      visiblePage = valid[p] ? p : 'main';
+    } catch (e) { visiblePage = 'main'; }
+  } else {
+    visiblePage = window.__currentView || 'main';
+  }
+
+  // 1) 헤더 + 사이드바 (모든 페이지 공통) — 항상 즉시
   renderBasic();
   renderMotto();
   renderHabits();
   renderSubmissions();
-  renderStats();
-  renderStudyTable();
-  renderStudyCards();
-  renderConditionReport();
-  renderExamReport();
-  renderChallenge();
   $('updated-at').textContent = DATA.meta ? '· ' + DATA.meta.loadedAt + ' 기준' : '';
   $('top-sub').textContent = DATA.basic.group + ' ' + DATA.basic.camp + ' · ' + DATA.basic.name;
 
-  // ⭐ URL ?page 파라미터로 초기 페이지 진입 (디스코드 봇에서 특정 페이지 링크 보낼 때)
-  //   첫 진입에만 1번 실행 (다음 renderAll에선 skip)
+  // 2) 페이지별 렌더 함수 매핑
+  //    (goals/weakness/mock/schedule/study-method/frequent-test는 sv()가 진입 시 자체 로드)
+  var pageRenders = {
+    'main':        function() { renderStats(); renderStudyTable(); renderStudyCards(); },
+    'condition':   renderConditionReport,
+    'exam-record': renderExamReport,
+    'challenge':   renderChallenge
+  };
+
+  // 3) 진입 페이지에 해당하는 렌더만 즉시 호출 → 화면이 빠르게 그려짐
+  if (pageRenders[visiblePage]) {
+    try { pageRenders[visiblePage](); } catch (e) { console.warn('진입 페이지 렌더 실패:', visiblePage, e && e.message); }
+  }
+
+  // 4) 캐시 동기화 — DATA가 변경됐든(optimistic UI) bg refresh로 갱신됐든
+  //    매 renderAll 직후 localStorage 캐시도 동기화. 다음 새로고침 시 stale window 제거.
+  try {
+    if (PoliceMakerAPI && PoliceMakerAPI.writeDataCache) {
+      PoliceMakerAPI.writeDataCache(DATA);
+    }
+  } catch (e) { /* localStorage 가득 차거나 비활성 — 무시 */ }
+
+  // 5) ⭐ URL ?page 파라미터로 초기 페이지 진입 (디스코드 봇에서 특정 페이지 링크 보낼 때)
+  //    첫 진입에만 1번 실행 (다음 renderAll에선 skip)
   if (!window.__initialPageApplied) {
     window.__initialPageApplied = true;
     applyInitialPageFromUrl_();
   }
+
+  // 6) ⭐ 나머지 페이지 렌더는 백그라운드 (다음 tick)
+  //    학생이 그 페이지로 이동했을 땐 이미 채워져 있어 즉시 표시.
+  //    setTimeout(0)이라 첫 페인트가 끝난 직후 실행 → 사용자 첫 화면 빠르게 유지.
+  setTimeout(function() {
+    Object.keys(pageRenders).forEach(function(p) {
+      if (p !== visiblePage) {
+        try { pageRenders[p](); } catch (e) { console.warn('지연 렌더 실패:', p, e && e.message); }
+      }
+    });
+  }, 0);
 }
 
 /**
@@ -12817,7 +12863,8 @@ function ftShowSavedResult(subject, round) {
       return PoliceMakerAPI.checkFrequentTestAnswers(subject, round, log.studentAnswers || {})
         .then(function(result) {
           result._unknownNumbers = [];  // 저장된 결과엔 모름 구분 없음
-          FT_RESULT = { subject: subject, round: round, mode: '전체', result: result };
+          // ⭐ 저장된 log에 durationSec이 이미 있음 (풀이 시 저장) — 결과 화면에 반영
+          FT_RESULT = { subject: subject, round: round, mode: '전체', result: result, durationSec: log.durationSec || 0 };
           FT_RESULT_FILTER = 'all';
           ftShowResultView_();
         });
@@ -14509,7 +14556,8 @@ function ftEnterNoteTestQuiz_(subject, items) {
     mode: '오답노트테스트',
     items: items,
     answers: {},
-    unknowns: {}
+    unknowns: {},
+    startTime: Date.now()  // ⭐ 풀이 시작 시각 (시간 측정용) — 오답노트테스트 모드도 시간 표시
   };
   // 풀이 화면 표시 (일일 컨테이너 빌려쓰기)
   FT_MODE = 'daily';
@@ -14636,7 +14684,11 @@ function ftEnterNoteTestQuiz_(subject, items) {
 
         FT_RESULT = {
           subject: subject, round: 0, mode: '오답노트테스트',
-          result: combined
+          result: combined,
+          // ⭐ 풀이 시간 (초) — ftEnterNoteTestQuiz_의 startTime 기준
+          durationSec: (FT_QUIZ_STATE && FT_QUIZ_STATE.startTime)
+            ? Math.floor((Date.now() - FT_QUIZ_STATE.startTime) / 1000)
+            : 0
         };
         FT_QUIZ_STATE = null;
         FT_RESULT_FILTER = 'all';

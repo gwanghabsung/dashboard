@@ -218,31 +218,81 @@
 
   // ───────────────────────────── HTTP 헬퍼 ─────────────────────────────
 
-  function fetchJson(url, options) {
+  // ⭐ fetchJson — 옵션으로 자동 재시도 지원 (v181)
+  //   retryOpts: { retries: N, backoffMs: [500, 1000] }
+  //   재시도 대상 (isTransient=true): 네트워크 에러, timeout, JSON 파싱 실패(GAS가 HTML 404 반환하는 케이스), 5xx status
+  //   GET은 idempotent라 안전. POST는 명시적으로 opts.retry=true 지정한 것만.
+  function fetchJson(url, options, retryOpts) {
     options = options || {};
-    var timeout = CONFIG.REQUEST_TIMEOUT_MS || 30000;
-    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    if (controller) options.signal = controller.signal;
-    var timer = setTimeout(function() {
-      if (controller) controller.abort();
-    }, timeout);
+    retryOpts = retryOpts || {};
+    var maxRetries = Math.max(0, Number(retryOpts.retries) || 0);
+    var backoffMs = retryOpts.backoffMs || [500, 1000, 2000];
+    var attempt = 0;
 
-    return fetch(url, options)
-      .then(function(res) {
-        clearTimeout(timer);
-        return res.text().then(function(text) {
-          try { return JSON.parse(text); }
-          catch (e) {
-            throw new Error('서버 응답이 JSON이 아닙니다 (status ' + res.status + '): ' +
-                            text.substring(0, 200));
+    function _attempt() {
+      // 매 시도마다 새 AbortController + 타이머 (이전 타이머 재사용 X)
+      var timeout = CONFIG.REQUEST_TIMEOUT_MS || 30000;
+      var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var attemptOpts = {};
+      Object.keys(options).forEach(function(k) { attemptOpts[k] = options[k]; });
+      if (controller) attemptOpts.signal = controller.signal;
+      var timer = setTimeout(function() {
+        if (controller) controller.abort();
+      }, timeout);
+
+      return fetch(url, attemptOpts)
+        .then(function(res) {
+          clearTimeout(timer);
+          // 5xx status는 응답 본문 파싱 전에 재시도 대상으로 마킹
+          var isServerError = res.status >= 500 && res.status < 600;
+          return res.text().then(function(text) {
+            try {
+              var json = JSON.parse(text);
+              // JSON 파싱 성공했더라도 5xx면 재시도 (백엔드가 에러 응답을 JSON으로 준 경우)
+              if (isServerError) {
+                var e5 = new Error('서버 오류 (status ' + res.status + '): ' + (json.message || json.error || text.substring(0, 200)));
+                e5.status = res.status;
+                e5.isTransient = true;
+                throw e5;
+              }
+              return json;
+            } catch (e) {
+              // JSON.parse 실패 케이스 — 위 throw e5도 여기 catch됨
+              if (e.isTransient) throw e;  // 이미 마킹된 재시도 대상은 그대로
+              var errParse = new Error('서버 응답이 JSON이 아닙니다 (status ' + res.status + '): ' +
+                              text.substring(0, 200));
+              errParse.status = res.status;
+              // JSON 파싱 실패는 재시도 대상 (GAS가 일시적으로 HTML 404 반환하는 케이스)
+              errParse.isTransient = true;
+              throw errParse;
+            }
+          });
+        })
+        .catch(function(err) {
+          clearTimeout(timer);
+          // timeout (AbortError)
+          if (err.name === 'AbortError') {
+            var errTimeout = new Error('요청 시간이 초과됐어요. 다시 시도해주세요.');
+            errTimeout.isTransient = true;
+            err = errTimeout;
           }
+          // 네트워크 에러 (fetch 자체 실패) — TypeError로 던져짐
+          if (err instanceof TypeError) {
+            err.isTransient = true;
+          }
+
+          // 재시도 판정
+          if (err.isTransient && attempt < maxRetries) {
+            attempt++;
+            var delay = backoffMs[attempt - 1] || backoffMs[backoffMs.length - 1] || 1000;
+            try { console.warn('[fetch 재시도 ' + attempt + '/' + maxRetries + '] ' + delay + 'ms 후 재시도:', err.message); } catch (_) {}
+            return new Promise(function(resolve) { setTimeout(resolve, delay); }).then(_attempt);
+          }
+          throw err;
         });
-      })
-      .catch(function(err) {
-        clearTimeout(timer);
-        if (err.name === 'AbortError') throw new Error('요청 시간이 초과됐어요. 다시 시도해주세요.');
-        throw err;
-      });
+    }
+
+    return _attempt();
   }
 
   // ───────────────────────────── 디렉터리 해석 ─────────────────────────────
@@ -304,7 +354,8 @@
       }
       var url = student.webAppUrl +
                 (student.webAppUrl.indexOf('?') >= 0 ? '&' : '?') + qs;
-      return fetchJson(url, { method: 'GET' });
+      // GET은 idempotent — 자동 재시도 2회 (500ms, 1000ms backoff)
+      return fetchJson(url, { method: 'GET' }, { retries: 2 });
     });
   }
 
@@ -320,7 +371,10 @@
       };
       // ⭐ keepalive — 페이지 unload 후에도 요청 보존 (optimistic UI용)
       if (opts.keepalive) fetchOpts.keepalive = true;
-      return fetchJson(student.webAppUrl, fetchOpts);
+      // POST는 기본 재시도 없음 (중복 제출 위험). opts.retry=true 지정한 경우에만 재시도.
+      //   → getFrequentTestProgress 등 GET-like POST에 사용. mutation(submit/save)에는 금지.
+      var retryOpts = opts.retry ? { retries: 2 } : {};
+      return fetchJson(student.webAppUrl, fetchOpts, retryOpts);
     });
   }
 
